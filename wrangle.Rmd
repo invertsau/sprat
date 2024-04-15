@@ -1,0 +1,197 @@
+---
+title: "Data wrangling"
+author: "Fonti Kar"
+date: "2024-04-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load dependencies
+
+```{r}
+# install.packages("pacman")
+pacman::p_load(tidyverse, janitor, snakecase, arrow)
+```
+
+### Read in data
+
+```{r}
+raw <- read_csv("data/15042024-095250-report.csv", name_repair = "minimal")
+```
+
+### Deal with two header problem
+
+```{r}
+# Column names
+higher_level_headers <- colnames(raw) |> snakecase::to_snake_case()
+
+# First row
+informed_headers <- c(raw[1,]) |> unname() |> unlist() |> snakecase::to_snake_case()
+
+# listed_name is non unique, need to paste on act/body name to listed_name
+informed_headers |> str_subset("^listed_name$")
+informed_headers |> str_subset("act")
+
+# Hard code solution for now using indices
+acts_cols <- informed_headers[31:45]
+
+# Drop the listed_name
+acts_names <- acts_cols |> str_subset("^listed_name", negate = TRUE)
+
+# Paste act names to listed_name
+fixed_listed_name <- paste(acts_names, "listed_name", sep = "")
+
+# Replace plain old listed_name with new improved ones
+informed_headers[informed_headers |> str_which("^listed_name$")] <- fixed_listed_name
+
+informed_headers
+
+# Paste these together
+combined_headers <- paste(higher_level_headers, informed_headers, sep = "-")
+
+# Remove 1st row of names
+cleaned_headers <- raw[-1,]
+
+# Rename column headers
+colnames(cleaned_headers) <- combined_headers
+
+colnames(cleaned_headers)
+```
+
+### Arrange the taxonomic data together, remove `epc_act`, remove `-NA`
+
+```{r}
+threatened_species <- cleaned_headers |> 
+  select(-starts_with("epc_act")) |> 
+  select(starts_with("current_name"), starts_with("taxonomic_data"), starts_with("state_territory"))
+
+colnames(threatened_species)
+```
+
+### Ditch long prefixes in names
+
+```{r}
+shortened_names <- colnames(threatened_species) |> 
+  str_remove("current_name_and_sprat_id-") |> 
+  str_remove("state_territory_and_international_threatened_species-") |> 
+  str_remove("taxonomic_data-")
+
+
+colnames(threatened_species) <- shortened_names
+colnames(threatened_species)
+```
+
+### Condense the acts/bodies together
+
+# Status 
+
+```{r}
+status_by_body <- threatened_species |> 
+  select(taxon_id:taxon_group, act_nc_act, wa_wc_act, nsw_tsc_act_and_fm_act, 
+                        qld_nc_act, tas_tsp_act, sa_npw_act, vic_ffg_act_advisory_lists, 
+                        iucn_red_list, nt_tpwc_act) |> 
+  pivot_longer(cols = c(act_nc_act:nt_tpwc_act), 
+               names_to = c("threatened_species_body"),
+               values_to = "conservation_status") |> 
+  relocate(threatened_species_body, conservation_status, .after = taxon_group)
+```
+
+# Listed names
+
+```{r}
+listed_names_by_body <- threatened_species |> 
+  select(taxon_id:taxon_group, ends_with("listed_name"), ends_with("listed_names")) |> 
+  pivot_longer(cols = c(act_nc_act_listed_name:iucn_red_list_listed_names), 
+               names_to = c("threatened_species_body"),
+               values_to = "listed_names") |> 
+  relocate(threatened_species_body, listed_names, .after = taxon_group)
+
+# Fix the values in threatened_species_body
+listed_names_by_body_cleaned_body <- listed_names_by_body |> 
+  mutate(threatened_species_body = str_remove_all(listed_names_by_body$threatened_species_body, "_listed_name")) 
+```
+
+### Condense the listed_names together
+
+```{r}
+nrow(status_by_body)
+nrow(listed_names_by_body)
+
+threatened_species_by_body <- left_join(status_by_body, listed_names_by_body_cleaned_body) 
+```
+
+### Invertebrates only Phylums
+
+```{r}
+threatened_species_by_body |> 
+  tabyl(phylum)
+
+threatened_inverts <- threatened_species_by_body |> 
+  filter(kingdom == "Animalia") |> 
+  filter(!phylum == "Chordata") 
+```
+
+### Exclude least concern and data deficient in IUCN
+
+```{r}
+threatened_inverts$conservation_status |> 
+  tabyl()
+
+threatened_inverts |> 
+  filter(! conservation_status == "Data Deficient" & ! conservation_status == "Least Concern") |> # First filter
+  filter(! str_detect(conservation_status, regex("deficient", ignore_case = TRUE))) |> # Instances where deficient is mentioned
+  filter(! str_detect(conservation_status, regex("least", ignore_case = TRUE))) |> # Instances where least is mentioned
+  filter(! is.na(conservation_status)) |> # Missing conservation status
+  tabyl(conservation_status)
+
+ditched_deficient_least_concern <- threatened_inverts |> 
+  filter(! conservation_status == "Data Deficient" & ! conservation_status == "Least Concern") |> # First filter
+  filter(! str_detect(conservation_status, regex("deficient", ignore_case = TRUE))) |> # Instances where deficient is mentioned
+  filter(! str_detect(conservation_status, regex("least", ignore_case = TRUE))) |> # Instances where least is mentioned
+  filter(! is.na(conservation_status))
+```
+
+### Fix up values in conservation status
+
+```{r}
+ditched_deficient_least_concern |> 
+  tabyl(conservation_status)
+
+ditched_deficient_least_concern |> 
+  mutate(conservation_status_cleaned = 
+           if_else(conservation_status == "Critically endangered", "Critically Endangered", conservation_status)
+         ) |> 
+  mutate(conservation_status_cleaned = 
+           if_else(conservation_status_cleaned == "Near Threatened, Near Threatened","Near Threatened", conservation_status_cleaned)
+         ) |>
+   mutate(conservation_status_cleaned = 
+           if_else(conservation_status_cleaned == "Presumed extinct","Presumed Extinct", conservation_status_cleaned)
+         ) |> 
+           tabyl(conservation_status_cleaned)
+
+
+cleaned_status <- ditched_deficient_least_concern |> 
+  mutate(conservation_status_cleaned = 
+           if_else(conservation_status == "Critically endangered", "Critically Endangered", conservation_status)
+         ) |> 
+  mutate(conservation_status_cleaned = 
+           if_else(conservation_status_cleaned == "Near Threatened, Near Threatened","Near Threatened", conservation_status_cleaned)
+         ) |>
+   mutate(conservation_status_cleaned = 
+           if_else(conservation_status_cleaned == "Presumed extinct","Presumed Extinct", conservation_status_cleaned)
+         )  
+```
+
+### Export
+
+```{r}
+write_csv(cleaned_status, file = paste0("output/", paste(Sys.Date(), "sprat_inverts_cleaned.csv", sep = "_")))
+```
+
+
+
+
+
